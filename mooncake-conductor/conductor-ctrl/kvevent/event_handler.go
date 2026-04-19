@@ -97,11 +97,12 @@ func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.Bloc
 		LoraName:    h.loraName,
 		InstanceID:  h.instanceID,
 		BlockSize:   h.blockSize,
+		Medium:      event.Medium,
 	}
 	indexer := h.manager.getIndexer()
 	er := indexer.ProcessRemoveEvent(conductorEvent, dpRank, h.instanceID)
 	if er != nil {
-		slog.Error("process store event failed.")
+		slog.Error("process remove event failed.")
 	}
 	slog.Debug("in handleBlockRemoved", "conductorEvent", conductorEvent)
 

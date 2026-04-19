@@ -14,6 +14,15 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
+var (
+	enableCpuEviction   = common.LoadBoolEnv("ENABLE_CPU_EVICTION", false)
+	maxCpuKeyNum        = int64(common.LoadIntEnv("MAX_CPU_KEY_NUM", 30000))
+	cpuKeyEvictionRatio = common.LoadFloatEnv("CPU_KEY_EVICTION_RATIO", 0.2)
+	// TODO 
+	// The eviction parameter here is used to control that the number of CPU cache prefixes cannot grow without limit.
+	// The best way is to add an zmq publisher in mooncake-store to actively notify conductor of the block eviction.
+)
+
 type ModelContext struct {
 	ModelName string
 	LoraName  string // None represents no LoRA adapter
@@ -31,10 +40,13 @@ type CacheStoreInfo struct {
 	// TODO  Currently, the KV cache at different levels is not distinguished.
 	// In the future, the caches of Mooncake and inference engines (vLLM, SGLang)
 	// should be handled separately.
-	engineLastAccessTime map[string]*atomic.Int64
+	engineLastAccessTime atomic.Int64
 	TotalReplicaNums     atomic.Int64
 	mediumSet            map[string]struct{}
 	dpRankSet            map[int64]struct{} // indicate the dp_rank that the block is cached on
+	// LRU linked list pointers
+	lruPrev *CacheStoreInfo
+	lruNext *CacheStoreInfo
 }
 
 type HashMapStore struct {
@@ -44,6 +56,9 @@ type HashMapStore struct {
 	createTime    time.Time
 	lastAccess    atomic.Int64
 	totalPrefixes int64
+	// LRU linked list: head is least recently used, tail is most recently used
+	lruHead *CacheStoreInfo
+	lruTail *CacheStoreInfo
 }
 
 type ContextData struct {
@@ -157,7 +172,6 @@ func (p *PrefixCacheTable) ComputePrefixHash(modelcontext *ModelContext, tokenId
 }
 
 func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds []int32) *CacheHitResult {
-	// slog.Debug("In CacheHitCompute", "modelName", modelcontext.ModelName, "loraName", modelcontext.LoraName)
 	value, exists := p.contextMap.Load(*modelcontext)
 	prefixMatchResult := &CacheHitResult{
 		LongestMatchTokens: 0,
@@ -190,6 +204,7 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 	for _, prefixHash := range prefixHashes {
 		cacheStoreInfo, exists := prefixStore.prefixMap[prefixHash]
 		slog.Debug("In CacheHitCompute", "cacheStoreInfo", cacheStoreInfo)
+		// chained hash, break if no replica exists
 		if !exists || cacheStoreInfo.TotalReplicaNums.Load() == 0 {
 			break
 		}
@@ -197,7 +212,6 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 		cacheHit := false
 
 		for key := range cacheStoreInfo.mediumSet {
-			slog.Debug("In CacheHitCompute", "medium", key)
 			if key == "cpu" {
 				prefixMatchResult.CPU += modelcontext.BlockSize
 				cacheHit = true
@@ -214,6 +228,10 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 			for dpRank := range cacheStoreInfo.dpRankSet {
 				prefixMatchResult.DP[dpRank] += modelcontext.BlockSize
 			}
+			cacheStoreInfo.engineLastAccessTime.Store(time.Now().Unix())
+			// move to tail (most recently used)
+			prefixStore.addToLRUTail(cacheStoreInfo)
+			// TODO update LRU list asynchronously
 		}
 	}
 
@@ -246,14 +264,6 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 		if len(event.BlockHashes) != 1 {
 			return fmt.Errorf("block hashes and tokens length mismatch")
 		}
-		// TOOO mooncake event, only one block hash, in the furture, remove it
-		// prefixStore := contextData.prefixStore
-		// for _, blockHash := range event.BlockHashes {
-		// 	if existingHash, exists := proxyHashMap[blockHash]; exists {
-		// 		p.addNewPrefixStore(prefixStore, existingHash, instanceID, event.Medium)
-		// 	}
-		// }
-		// return nil
 	}
 
 	newPrefixStore := make([]struct {
@@ -262,7 +272,6 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 	}, 0)
 
 	var parentHash uint64 = contextData.seed
-	slog.Debug("In ProcessStoreEvent", "seed", parentHash)
 
 	// TODO If the ParentBlockHash happens to be 0, a bug will occur here, because 0 is a valid hash value.
 	if event.ParentBlockHash != 0 {
@@ -305,6 +314,11 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 			slog.Debug("show new prefix data", "newPrefix", newPrefix)
 			p.addNewPrefixStore(prefixStore, newPrefix.hashValue, newPrefix.engineID, event.Medium, dpRank)
 		}
+		if enableCpuEviction && prefixStore.totalPrefixes > maxCpuKeyNum {
+			evictedCount := prefixStore.evictLRU(cpuKeyEvictionRatio)
+			slog.Info("LRU eviction triggered", "totalPrefixes", prefixStore.totalPrefixes, "evictedCount", evictedCount)
+		}
+
 	}
 
 	return nil
@@ -314,7 +328,6 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
-	// TODO @yejj710  Debug remove_event
 
 	contextData := p.getContextData(&ModelContext{
 		ModelName:      event.ModelName,
@@ -331,28 +344,35 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 	removeConductorHash := make([]uint64, 0, len(event.BlockHashes))
 
 	// delete proxyHashMapping
-	for _, blockHash := range event.BlockHashes {
-		if conductorHash, exists := proxyHashMap[blockHash]; exists {
-			delete(proxyHashMap, blockHash)
-			removeConductorHash = append(removeConductorHash, conductorHash)
-		}
-	}
-
 	contextData.prefixMu.Lock()
 	defer contextData.prefixMu.Unlock()
 	prefixStore := contextData.prefixStore
+	for _, blockHash := range event.BlockHashes {
+		if conductorHash, exists := proxyHashMap[blockHash]; exists {
+			removeConductorHash = append(removeConductorHash, conductorHash)
+			// Only delete proxyHashMapping entry when all replicas are removed
+			cacheStoreInfo, exists := prefixStore.prefixMap[conductorHash]
+			if !exists {
+				continue
+			}
+			if cacheStoreInfo.TotalReplicaNums.Load() == 1 {
+				delete(proxyHashMap, blockHash)
+			}
+		}
+	}
+
+	// update prefixStore
 	for _, conductorHash := range removeConductorHash {
 		cacheStoreInfo, exists := prefixStore.prefixMap[conductorHash]
 		if !exists {
 			continue
 		}
 
-		// Decrement replica count
 		cacheStoreInfo.TotalReplicaNums.Add(-1)
 
 		// Remove per-instance metadata
-		delete(cacheStoreInfo.engineLastAccessTime, instanceID)
 		delete(cacheStoreInfo.dpRankSet, dpRank)
+		delete(cacheStoreInfo.mediumSet, event.Medium)
 
 		// Only delete entry when all replicas are removed
 		if cacheStoreInfo.TotalReplicaNums.Load() <= 0 {
@@ -384,7 +404,6 @@ func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValu
 	if prefixStore.prefixMap[hashValue] == nil {
 		slog.Debug("in addNewPrefixStore, prefixStore.prefixMap[hashValue] is nil", "hashValue", hashValue)
 		prefixStore.prefixMap[hashValue] = &CacheStoreInfo{
-			engineLastAccessTime: make(map[string]*atomic.Int64),
 			mediumSet:            make(map[string]struct{}),
 			dpRankSet:            make(map[int64]struct{}),
 		}
@@ -392,17 +411,15 @@ func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValu
 	}
 	cacheStoreInfo := prefixStore.prefixMap[hashValue]
 
-	if _, exists := cacheStoreInfo.engineLastAccessTime[instanceID]; !exists {
-		var newTime atomic.Int64
-		newTime.Store(now)
-		cacheStoreInfo.engineLastAccessTime[instanceID] = &newTime
-	} else {
-		cacheStoreInfo.engineLastAccessTime[instanceID].Store(now)
-	}
+	cacheStoreInfo.engineLastAccessTime.Store(now)
 	cacheStoreInfo.TotalReplicaNums.Add(1)
+	// TODO If using Mooncake-Store, you do not need to set dpRank, because it does not distinguish between kv-blocks of different dpRanks.
 	cacheStoreInfo.mediumSet[medium] = struct{}{}
 	cacheStoreInfo.dpRankSet[dpRank] = struct{}{}
 	slog.Debug("in addNewPrefixStore", "conductor_hash", hashValue, "current_mediumset", cacheStoreInfo.mediumSet[medium])
+
+	// move to tail (most recently used)
+	prefixStore.addToLRUTail(cacheStoreInfo)
 }
 
 func (p *PrefixCacheTable) GetGlobalView() *GlobalView {
@@ -438,4 +455,102 @@ func (p *PrefixCacheTable) GetGlobalView() *GlobalView {
 	})
 
 	return view
+}
+
+// move or add a CacheStoreInfo to the tail of the LRU list (most recently used)
+func (h *HashMapStore) addToLRUTail(cacheNode *CacheStoreInfo) {
+	if cacheNode == nil {
+		return
+	}
+
+	// If already in list, remove it first
+	if cacheNode.lruPrev != nil || cacheNode.lruNext != nil || h.lruHead == cacheNode {
+		h.removeFromLRU(cacheNode)
+	}
+
+	if h.lruTail == nil {
+		// Empty list
+		h.lruHead = cacheNode
+		h.lruTail = cacheNode
+		cacheNode.lruPrev = nil
+		cacheNode.lruNext = nil
+	} else {
+		h.lruTail.lruNext = cacheNode
+		cacheNode.lruPrev = h.lruTail
+		cacheNode.lruNext = nil
+		h.lruTail = cacheNode
+	}
+}
+
+// remove a CacheStoreInfo from the LRU list
+func (h *HashMapStore) removeFromLRU(cacheNode *CacheStoreInfo) {
+	if cacheNode == nil {
+		return
+	}
+
+	if cacheNode.lruPrev != nil {
+		cacheNode.lruPrev.lruNext = cacheNode.lruNext
+	} else {
+		// cacheNode is head
+		h.lruHead = cacheNode.lruNext
+	}
+
+	if cacheNode.lruNext != nil {
+		cacheNode.lruNext.lruPrev = cacheNode.lruPrev
+	} else {
+		// cacheNode is tail
+		h.lruTail = cacheNode.lruPrev
+	}
+
+	cacheNode.lruPrev = nil
+	cacheNode.lruNext = nil
+}
+
+// evict the least recently used cpu mediums based on eviction ratio
+func (h *HashMapStore) evictLRU(ratio float64) int {
+	if h.lruHead == nil || ratio <= 0 {
+		return 0
+	}
+	// TODO Here it is assumed that each CacheStoreInfo contains a cpu medium, but in practice such assumptions should not be made. 
+	// Instead, a separate variable should be used to record the number of cpu mediums.
+	targetCount := int(float64(h.totalPrefixes) * ratio)
+	evictedCount := 0
+
+	// Traverse from head (least recently used)
+	for h.lruHead != nil && evictedCount < targetCount {
+		cacheNode := h.lruHead
+
+		// Only evict `cpu` medium
+		if _, exist := cacheNode.mediumSet["cpu"]; exist {
+			delete(cacheNode.mediumSet, "cpu")
+
+			// If no mediums left, remove the entry entirely
+			if len(cacheNode.mediumSet) == 0 {
+				h.removeFromLRU(cacheNode)
+				h.deleteCacheStoreInfo(cacheNode)
+				// TODO remove proxyHashMapping in ContextData, 
+				// currently we do not maintain reverse mapping from conductor hash to proxy hash, 
+				// which makes it hard to delete the proxyHashMapping entry. 
+				h.totalPrefixes--
+			}
+		} else {
+			// Move to LRU-List tail
+			h.removeFromLRU(cacheNode)
+			h.addToLRUTail(cacheNode)
+		}
+		evictedCount++
+	}
+
+	return evictedCount
+}
+
+
+func (h *HashMapStore) deleteCacheStoreInfo(cacheNode *CacheStoreInfo) {
+
+	for k, v := range h.prefixMap {
+		if v == cacheNode {
+			delete(h.prefixMap, k)
+			return
+		}
+	}
 }

@@ -54,6 +54,36 @@ func LoadIntEnv(envName string, defaultEnv int) int {
 	return defaultEnv
 }
 
+func LoadBoolEnv(envName string, defaultEnv bool) bool {
+	value := os.Getenv(envName)
+	trimmedValue := strings.TrimSpace(value)
+	if value != "" {
+		boolValue, err := strconv.ParseBool(value)
+		if err != nil {
+			slog.Error("invalid value for environment variable", "envName", envName, "value", trimmedValue)
+		} else {
+			return boolValue
+		}
+	}
+	slog.Warn("environment variable is not set, using default value", "envName", envName, "defaultValue", defaultEnv)
+	return defaultEnv
+}
+
+func LoadFloatEnv(envName string, defaultEnv float64) float64 {
+	value := os.Getenv(envName)
+	trimmedValue := strings.TrimSpace(value)
+	if value != "" {
+		floatValue, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			slog.Error("invalid value for environment variable", "envName", envName, "value", trimmedValue)
+		} else {
+			return floatValue
+		}
+	}
+	slog.Warn("environment variable is not set, using default value", "envName", envName, "defaultValue", defaultEnv)
+	return defaultEnv
+}
+
 func ExtractTokenIdFromRequest(data map[string]interface{}, key string) ([]int32, error) {
 	raw, exists := data[key]
 	if !exists {
