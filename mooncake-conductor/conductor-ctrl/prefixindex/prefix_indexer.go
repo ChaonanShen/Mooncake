@@ -230,8 +230,10 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 			}
 			cacheStoreInfo.engineLastAccessTime.Store(time.Now().Unix())
 			// move to tail (most recently used)
-			prefixStore.addToLRUTail(cacheStoreInfo)
-			// TODO update LRU list asynchronously
+			if enableCpuEviction {
+				prefixStore.addToLRUTail(cacheStoreInfo)
+				// TODO update LRU list asynchronously
+			}
 		}
 	}
 
@@ -373,6 +375,7 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 		// Remove per-instance metadata
 		delete(cacheStoreInfo.dpRankSet, dpRank)
 		delete(cacheStoreInfo.mediumSet, event.Medium)
+		slog.Info("process remove event", "conductorHash", conductorHash, "dpRank", dpRank, "medium", event.Medium)
 
 		// Only delete entry when all replicas are removed
 		if cacheStoreInfo.TotalReplicaNums.Load() <= 0 {
@@ -419,7 +422,9 @@ func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValu
 	slog.Debug("in addNewPrefixStore", "conductor_hash", hashValue, "current_mediumset", cacheStoreInfo.mediumSet[medium])
 
 	// move to tail (most recently used)
-	prefixStore.addToLRUTail(cacheStoreInfo)
+	if enableCpuEviction {
+		prefixStore.addToLRUTail(cacheStoreInfo)
+	}
 }
 
 func (p *PrefixCacheTable) GetGlobalView() *GlobalView {
